@@ -8,10 +8,8 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use futures::stream::FuturesUnordered;
 use futures::task::{LocalFutureObj, LocalSpawn, LocalSpawnExt, SpawnError};
-use futures::{Stream, StreamExt};
-use libuv::{
-    AsyncHandle, Buf, ConnectCB, Loop, ReadCB, ReadonlyBuf, StreamTrait, TcpHandle, WriteCB,
-};
+use futures::{Stream, StreamExt, pin_mut};
+use libuv::{AsyncHandle, Buf, ConnectCB, Loop, ReadCB, StreamTrait, TcpHandle, WriteCB};
 use libuv_sys2::uv_loop_t;
 use nvim_oxi::api::{self, Window, notify, opts::*, types::*};
 use nvim_oxi::lua::ffi::State;
@@ -28,11 +26,13 @@ struct SeanVim {
     waker: Option<Waker>,
 }
 
+#[derive(Clone)]
 pub struct LocalSpawner {
     incoming: Weak<Incoming>,
     waker: Option<Waker>,
 }
 
+#[derive(Clone)]
 pub struct LuvWaker {
     handle: Arc<Mutex<Option<AsyncHandle>>>,
 }
@@ -146,6 +146,7 @@ impl SeanVim {
 }
 
 //Let's make an http call
+#[derive(Clone)]
 struct MyTcp {
     handle: TcpHandle,
 }
@@ -159,7 +160,8 @@ impl MyTcp {
     pub async fn connect(&mut self, addr: SocketAddr) -> Result<u32, libuv::Error> {
         let ccb = ConnectFuture::new();
         let r = self.handle.connect(&addr, &ccb);
-        if let Err(_e) = r {
+        if let Err(e) = r {
+            print!("ERRORS HAPPEN:connect: {}", e);
             return Err(libuv::Error::EFAULT);
         }
         ccb.await
@@ -169,28 +171,29 @@ impl MyTcp {
         let wcb = WriteFuture::new();
         let bufs = Buf::new(&s).unwrap();
         let r = self.handle.write(&[bufs], &wcb);
-        if let Err(_e) = r {
-            return Err(libuv::Error::EFAULT);
+        if let Err(e) = r {
+            print!("ERRORS HAPPEN:write: {}", e);
+            return Err(e);
         }
         wcb.await
     }
 
     fn read_start(&mut self) -> Result<Box<ReadStream>, libuv::Error> {
-        print!("READSTART: 1");
         let rs = Box::new(ReadStream::new());
         let r = self.handle.read_start(
             |_handle, size| {
-                print!("READSTART: 1A");
                 Some(Buf::with_capacity(size).unwrap())
             },
             rs.as_ref(),
         );
         if let Err(e) = r {
+            print!("ERRORS HAPPEN:read_start: {}", e);
             return Err(e);
         }
         Ok(rs)
     }
 
+    #[allow(dead_code)]
     fn read_stop(&mut self) -> Result<(), libuv::Error> {
         self.handle.read_stop()
     }
@@ -202,6 +205,7 @@ impl MyTcp {
     */
 }
 
+#[derive(Clone)]
 struct ConnectFuture {
     waker: Rc<RefCell<Option<Waker>>>,
     result: Rc<RefCell<Option<Result<u32, libuv::Error>>>>,
@@ -231,6 +235,7 @@ impl Future for ConnectFuture {
     }
 }
 
+#[allow(clippy::from_over_into)]
 impl Into<ConnectCB<'static>> for &ConnectFuture {
     fn into(self) -> ConnectCB<'static> {
         let iw = self.waker.clone();
@@ -245,6 +250,7 @@ impl Into<ConnectCB<'static>> for &ConnectFuture {
     }
 }
 
+#[derive(Clone)]
 struct WriteFuture {
     waker: Rc<RefCell<Option<Waker>>>,
     result: Rc<RefCell<Option<Result<u32, libuv::Error>>>>,
@@ -274,6 +280,7 @@ impl Future for WriteFuture {
     }
 }
 
+#[allow(clippy::from_over_into)]
 impl Into<WriteCB<'static>> for &WriteFuture {
     fn into(self) -> WriteCB<'static> {
         let iw = self.waker.clone();
@@ -288,9 +295,10 @@ impl Into<WriteCB<'static>> for &WriteFuture {
     }
 }
 
+#[derive(Clone)]
 struct ReadStream {
     waker: Rc<RefCell<Option<Waker>>>,
-    result: Rc<RefCell<Option<Result<(usize, ReadonlyBuf), libuv::Error>>>>,
+    result: Rc<RefCell<Option<Result<String, libuv::Error>>>>,
 }
 
 impl ReadStream {
@@ -303,22 +311,17 @@ impl ReadStream {
 }
 
 impl Stream for ReadStream {
-    type Item = Result<(usize, ReadonlyBuf), libuv::Error>;
+    type Item = Result<String, libuv::Error>;
     fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        //The callback should transfer the result (inputs for the cb) to this future and then call
-        //wake
-        print!("READSTART: POLL: 1");
+        //The callback should transfer the result  to this future and then call wake
         match self.result.borrow_mut().take() {
             Some(r) => {
-                print!("READSTART: POLL: Some: 1");
                 if r.is_err() {
                     return Poll::Ready(None);
                 }
-                print!("READSTART: POLL: Some: 2");
                 Poll::Ready(Some(r))
             }
             None => {
-                print!("READSTART: POLL: None");
                 self.waker.replace(Some(cx.waker().clone()));
                 Poll::Pending
             }
@@ -326,17 +329,19 @@ impl Stream for ReadStream {
     }
 }
 
+#[allow(clippy::from_over_into)]
 impl Into<ReadCB<'static>> for &ReadStream {
     fn into(self) -> ReadCB<'static> {
         let iw = self.waker.clone();
         let ir = self.result.clone();
         ReadCB::CB(Box::new(move |_handle, status, buffer| {
-            print!("READSTART: CB: 1");
             //I am finished, let's store the result back into myself and then call the waker
             if status.is_err() {
                 return;
             }
-            ir.borrow_mut().replace(Ok((status.unwrap(), buffer)));
+            //I think this buffer dissapears after I return right here
+            let s = String::from(buffer.to_str(status.unwrap()).unwrap());
+            ir.borrow_mut().replace(Ok(s));
             if let Some(ref w) = *iw.borrow() {
                 w.wake_by_ref();
             }
@@ -529,6 +534,7 @@ pub fn seanvim() -> nvim_oxi::Result<Dictionary> {
         let _ = notify("Hello", LogLevel::Info, &Dictionary::new());
     });
 
+    let mut b = buf.clone();
     let _ = sean_vim.borrow().spawner().spawn_local(async move {
         let mut my_tcp = MyTcp::new(&l);
         let addr: SocketAddr = SocketAddr::from_str("192.168.254.37:11434").unwrap();
@@ -549,9 +555,7 @@ pub fn seanvim() -> nvim_oxi::Result<Dictionary> {
             return;
         }
         let out = String::from(
-            r#"GET / HTTP/1.1\r
-Host: localhost\r
-Connection: close\r\n\r\n"#,
+            "GET / HTTP/1.1\r\nHost: localhost\r\nUser-Agent: nvim-libuv\r\nAccept: */*\r\nConnection: close\r\n\r\n",
         );
         let r = my_tcp.write(out).await;
         let _ = match r {
@@ -560,22 +564,23 @@ Connection: close\r\n\r\n"#,
         };
         use futures::StreamExt;
         let read_stream = my_tcp.read_start();
-        if let Ok(mut read_stream) = read_stream {
+        if let Ok(read_stream) = read_stream {
+            pin_mut!(read_stream);
             loop {
                 let r = read_stream.next().await;
                 if let Some(r) = r {
-                    let _ = match r {
-                        Ok(r) => notify(
-                            &format!("Read! {}", r.0),
-                            LogLevel::Info,
-                            &Dictionary::new(),
-                        ),
+                    match r {
+                        Ok(r) => {
+                            let _ = b.set_lines(.., false, vec!(r));
+                        },
                         Err(e) => {
-                            notify(&format!("Read? {}", e), LogLevel::Info, &Dictionary::new())
+                            let _ = notify(&format!("Read? {}", e), LogLevel::Info, &Dictionary::new());
                         }
                     };
                 }
             }
+        }else{
+            print!("an error!");
         }
     });
 
