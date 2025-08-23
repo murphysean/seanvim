@@ -1,6 +1,9 @@
 use std::cell::RefCell;
+use std::collections::LinkedList;
+use std::io::ErrorKind;
 use std::mem;
 use std::net::SocketAddr;
+use std::ops::{Index, IndexMut};
 use std::rc::{Rc, Weak};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -8,8 +11,10 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use futures::stream::FuturesUnordered;
 use futures::task::{LocalFutureObj, LocalSpawn, LocalSpawnExt, SpawnError};
-use futures::{Stream, StreamExt, pin_mut};
-use libuv::{AsyncHandle, Buf, ConnectCB, Loop, ReadCB, StreamTrait, TcpHandle, WriteCB};
+use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Stream, StreamExt, pin_mut};
+use libuv::{
+    AsyncHandle, Buf, ConnectCB, Loop, ReadCB, ReadonlyBuf, StreamTrait, TcpHandle, WriteCB,
+};
 use libuv_sys2::uv_loop_t;
 use nvim_oxi::api::{self, Window, notify, opts::*, types::*};
 use nvim_oxi::lua::ffi::State;
@@ -149,12 +154,22 @@ impl SeanVim {
 #[derive(Clone)]
 struct MyTcp {
     handle: TcpHandle,
+    writes: Rc<RefCell<Vec<Option<Waker>>>>,
+    read_start: Rc<RefCell<bool>>,
+    read_waker: Rc<RefCell<Option<Waker>>>,
+    reads: Rc<RefCell<LinkedList<Result<(usize, usize, ReadonlyBuf), libuv::Error>>>>,
 }
 
 impl MyTcp {
     fn new(l: &Loop) -> Self {
         let tcp_h: TcpHandle = TcpHandle::new(l).unwrap();
-        Self { handle: tcp_h }
+        Self {
+            handle: tcp_h,
+            writes: Rc::new(RefCell::new(Vec::new())),
+            read_start: Rc::new(RefCell::new(false)),
+            read_waker: Rc::new(RefCell::new(None)),
+            reads: Rc::new(RefCell::new(LinkedList::new())),
+        }
     }
 
     pub async fn connect(&mut self, addr: SocketAddr) -> Result<u32, libuv::Error> {
@@ -167,6 +182,7 @@ impl MyTcp {
         ccb.await
     }
 
+    /*
     async fn write(&mut self, s: String) -> Result<u32, libuv::Error> {
         let wcb = WriteFuture::new();
         let bufs = Buf::new(&s).unwrap();
@@ -181,9 +197,7 @@ impl MyTcp {
     fn read_start(&mut self) -> Result<Box<ReadStream>, libuv::Error> {
         let rs = Box::new(ReadStream::new());
         let r = self.handle.read_start(
-            |_handle, size| {
-                Some(Buf::with_capacity(size).unwrap())
-            },
+            |_handle, size| Some(Buf::with_capacity(size).unwrap()),
             rs.as_ref(),
         );
         if let Err(e) = r {
@@ -192,6 +206,7 @@ impl MyTcp {
         }
         Ok(rs)
     }
+    */
 
     #[allow(dead_code)]
     fn read_stop(&mut self) -> Result<(), libuv::Error> {
@@ -203,6 +218,164 @@ impl MyTcp {
         self.handle.close()
     }
     */
+}
+
+impl AsyncRead for MyTcp {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut_self = self.get_mut();
+        let started_reading = *mut_self.read_start.borrow();
+        if !started_reading {
+            mut_self.read_start.replace(true);
+            let ir = mut_self.reads.clone();
+            let iw = mut_self.read_waker.clone();
+            let r = mut_self.handle.read_start(
+                Box::new(|_handle, size| Some(Buf::with_capacity(size).unwrap())),
+                Box::new(
+                    move |_handle, status: Result<usize, libuv::Error>, buffer| {
+                        match status {
+                            Ok(nread) => {
+                                ir.borrow_mut().push_back(Ok((0, nread, buffer)));
+                                if let Some(w) = iw.take() {
+                                    w.wake();
+                                }
+                            }
+                            Err(e) => {
+                                ir.borrow_mut().push_back(Err(e));
+                                if let Some(w) = iw.take() {
+                                    w.wake();
+                                }
+                            }
+                        };
+                    },
+                ),
+            );
+            if let Err(e) = r {
+                print!("ERRORS HAPPEN:read_start: {}", e);
+                return Poll::Ready(Err(std::io::Error::other(e)));
+            }
+        }
+
+        print!("HERE0");
+        if mut_self.read_waker.borrow().is_some() {
+            print!("HERE1");
+            return Poll::Ready(Err(std::io::Error::from(ErrorKind::AlreadyExists)));
+        }
+
+        print!("HERE2");
+        if mut_self.reads.borrow().is_empty() {
+            print!("HERE3");
+            mut_self.read_waker.borrow_mut().replace(cx.waker().clone());
+            return Poll::Pending;
+        }
+
+        Poll::Ready(copy_into_from_vec_buffs(
+            buf,
+            &mut mut_self.reads.borrow_mut(),
+        ))
+    }
+}
+
+//Will consume from the vec of buffers into the into_buff until it is full or there is nothing left
+fn copy_into_from_vec_buffs(
+    into_buff: &mut [u8],
+    from_buffs: &mut LinkedList<Result<(usize, usize, ReadonlyBuf), libuv::Error>>,
+) -> Result<usize, std::io::Error> {
+    let mut into_buff_bytes_read: usize = 0;
+
+    print!("MVNBF0: br: {},{}", into_buff_bytes_read, into_buff.len());
+    loop {
+        //Check incoming
+        match from_buffs.front_mut() {
+            Some(Ok((start, len, b))) => {
+                print!("MVNBF1: br: {},{} f: {},{}", into_buff_bytes_read, into_buff.len(), start, len);
+                //If there is less (or equal) incoming than room in my buffer, consume it all and copy into incoming
+                //and return bytes_consumed
+                if (*len - *start) <= into_buff.len() - into_buff_bytes_read {
+                    let nsb: &mut [u8] = into_buff.index_mut(into_buff_bytes_read..*len - *start);
+                    nsb.copy_from_slice(b.index(*start..*len));
+                    into_buff_bytes_read += *len - *start;
+                    from_buffs.pop_front();
+                } else {
+                    //If there is not enough room in my buffer for the amount in the incoming then update that
+                    //to reflect how much I was able to read, leave it alone and then
+                    let into_len = into_buff.len();
+                    let nsb: &mut [u8] = into_buff.index_mut(into_buff_bytes_read..);
+                    nsb.copy_from_slice(b.index(*start..(*start + into_len)));
+                    into_buff_bytes_read += *start + into_len;
+                    *start += into_len;
+                }
+            }
+            Some(Err(e)) => {
+                print!("MVNBF2: br: {},{} e: {}", into_buff_bytes_read, into_buff.len(), e);
+                if let libuv::EOF = e {
+                    return Ok(into_buff_bytes_read);
+                }
+                let ret =Err(std::io::Error::other(*e)); 
+                //Consume the error off the buffer and return it
+                from_buffs.pop_front();
+                return ret;
+            }
+            _ => {}
+        }
+        print!("MVNBF3: br: {},{}", into_buff_bytes_read, into_buff.len());
+        if into_buff_bytes_read >= into_buff.len() {
+            break;
+        }
+    }
+
+    print!("MVNBF4: br: {},{}", into_buff_bytes_read, into_buff.len());
+    Ok(into_buff_bytes_read)
+}
+
+impl AsyncWrite for MyTcp {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        //Need to dump the bytes and return ready for this buffer
+        let bufs = Buf::new_from_bytes(buf).unwrap();
+        let writes = self.writes.clone();
+        writes.borrow_mut().push(None);
+        //set up a callback for flush to wait on if called
+        let r = self
+            .get_mut()
+            .handle
+            .write(&[bufs], move |_handle, _status| {
+                if let Some(Some(w)) = writes.borrow_mut().pop() {
+                    w.wake_by_ref();
+                }
+            });
+        match r {
+            Ok(_r) => Poll::Ready(Ok(buf.len())),
+            Err(e) => Poll::Ready(Err(std::io::Error::other(e))),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.writes.borrow().is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+
+        //Set myself up as a waker on the bottom of the stack
+        if let Some(i) = self.writes.borrow_mut().get_mut(0) {
+            i.replace(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        todo!()
+    }
 }
 
 #[derive(Clone)]
@@ -250,6 +423,7 @@ impl Into<ConnectCB<'static>> for &ConnectFuture {
     }
 }
 
+/*
 #[derive(Clone)]
 struct WriteFuture {
     waker: Rc<RefCell<Option<Waker>>>,
@@ -348,6 +522,7 @@ impl Into<ReadCB<'static>> for &ReadStream {
         }))
     }
 }
+*/
 
 unsafe extern "C" {
     pub fn luv_loop(lua_state: *mut State) -> *mut uv_loop_t;
@@ -557,13 +732,20 @@ pub fn seanvim() -> nvim_oxi::Result<Dictionary> {
         let out = String::from(
             "GET / HTTP/1.1\r\nHost: localhost\r\nUser-Agent: nvim-libuv\r\nAccept: */*\r\nConnection: close\r\n\r\n",
         );
-        let r = my_tcp.write(out).await;
+        let r = my_tcp.write(out.as_bytes()).await;
         let _ = match r {
             Ok(r) => notify(&format!("Wrote! {}", r), LogLevel::Info, &Dictionary::new()),
             Err(e) => notify(&format!("Wrote? {}", e), LogLevel::Info, &Dictionary::new()),
         };
-        use futures::StreamExt;
-        let read_stream = my_tcp.read_start();
+        let mut in_vec: Vec<u8> = vec![0;2048];
+        let r = my_tcp.read(&mut in_vec[..]).await;
+        let _ = match r {
+            Ok(r) => notify(&format!("Read! {}", r), LogLevel::Info, &Dictionary::new()),
+            Err(e) => notify(&format!("Read? {}", e), LogLevel::Info, &Dictionary::new()),
+        };
+        //use futures::StreamExt;
+        //let read_stream = my_tcp.read_start();
+        /*
         if let Ok(read_stream) = read_stream {
             pin_mut!(read_stream);
             loop {
@@ -582,6 +764,7 @@ pub fn seanvim() -> nvim_oxi::Result<Dictionary> {
         }else{
             print!("an error!");
         }
+        */
     });
 
     Ok(api)
