@@ -3,7 +3,6 @@ use std::collections::LinkedList;
 use std::io::ErrorKind;
 use std::mem;
 use std::net::SocketAddr;
-use std::ops::{Index, IndexMut};
 use std::rc::{Rc, Weak};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -11,9 +10,11 @@ use std::task::{Context, Poll, Wake, Waker};
 
 use futures::stream::FuturesUnordered;
 use futures::task::{LocalFutureObj, LocalSpawn, LocalSpawnExt, SpawnError};
-use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, Stream, StreamExt, pin_mut};
+use futures::{AsyncRead, AsyncWrite, StreamExt};
+use http_types::Request;
+use http_types::convert::{Deserialize, Serialize, json};
 use libuv::{
-    AsyncHandle, Buf, ConnectCB, Loop, ReadCB, ReadonlyBuf, StreamTrait, TcpHandle, WriteCB,
+    AsyncHandle, Buf, BufTrait, ConnectCB, HandleTrait, Loop, ReadonlyBuf, StreamTrait, TcpHandle,
 };
 use libuv_sys2::uv_loop_t;
 use nvim_oxi::api::{self, Window, notify, opts::*, types::*};
@@ -150,6 +151,8 @@ impl SeanVim {
     }
 }
 
+type ReadTup = (usize, usize, ReadonlyBuf);
+
 //Let's make an http call
 #[derive(Clone)]
 struct MyTcp {
@@ -157,8 +160,13 @@ struct MyTcp {
     writes: Rc<RefCell<Vec<Option<Waker>>>>,
     read_start: Rc<RefCell<bool>>,
     read_waker: Rc<RefCell<Option<Waker>>>,
-    reads: Rc<RefCell<LinkedList<Result<(usize, usize, ReadonlyBuf), libuv::Error>>>>,
+    reads: Rc<RefCell<LinkedList<Result<ReadTup, libuv::Error>>>>,
+    close_waker: Rc<RefCell<Option<Waker>>>,
 }
+
+unsafe impl Sync for MyTcp {}
+
+unsafe impl Send for MyTcp {}
 
 impl MyTcp {
     fn new(l: &Loop) -> Self {
@@ -169,6 +177,7 @@ impl MyTcp {
             read_start: Rc::new(RefCell::new(false)),
             read_waker: Rc::new(RefCell::new(None)),
             reads: Rc::new(RefCell::new(LinkedList::new())),
+            close_waker: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -176,48 +185,11 @@ impl MyTcp {
         let ccb = ConnectFuture::new();
         let r = self.handle.connect(&addr, &ccb);
         if let Err(e) = r {
-            print!("ERRORS HAPPEN:connect: {}", e);
+            eprintln!("ERRORS HAPPEN:connect: {}", e);
             return Err(libuv::Error::EFAULT);
         }
         ccb.await
     }
-
-    /*
-    async fn write(&mut self, s: String) -> Result<u32, libuv::Error> {
-        let wcb = WriteFuture::new();
-        let bufs = Buf::new(&s).unwrap();
-        let r = self.handle.write(&[bufs], &wcb);
-        if let Err(e) = r {
-            print!("ERRORS HAPPEN:write: {}", e);
-            return Err(e);
-        }
-        wcb.await
-    }
-
-    fn read_start(&mut self) -> Result<Box<ReadStream>, libuv::Error> {
-        let rs = Box::new(ReadStream::new());
-        let r = self.handle.read_start(
-            |_handle, size| Some(Buf::with_capacity(size).unwrap()),
-            rs.as_ref(),
-        );
-        if let Err(e) = r {
-            print!("ERRORS HAPPEN:read_start: {}", e);
-            return Err(e);
-        }
-        Ok(rs)
-    }
-    */
-
-    #[allow(dead_code)]
-    fn read_stop(&mut self) -> Result<(), libuv::Error> {
-        self.handle.read_stop()
-    }
-
-    /*
-    fn close_reset(&mut self){
-        self.handle.close()
-    }
-    */
 }
 
 impl AsyncRead for MyTcp {
@@ -233,11 +205,32 @@ impl AsyncRead for MyTcp {
             let ir = mut_self.reads.clone();
             let iw = mut_self.read_waker.clone();
             let r = mut_self.handle.read_start(
-                Box::new(|_handle, size| Some(Buf::with_capacity(size).unwrap())),
+                Box::new(|_handle, size| {
+                    let nb = Buf::with_capacity(size).unwrap();
+                    eprintln!(
+                        "ALLOC: size:{}, ptr: {:?}, base: {:?}, len: {:?}",
+                        size,
+                        nb.buf,
+                        unsafe { *nb.buf }.base,
+                        unsafe { *nb.buf }.len
+                    );
+                    Some(nb)
+                }),
                 Box::new(
-                    move |_handle, status: Result<usize, libuv::Error>, buffer| {
+                    move |_handle, status: Result<usize, libuv::Error>, buffer: ReadonlyBuf| {
                         match status {
                             Ok(nread) => {
+                                //When this finishes the alloc'd buffer is gone and replaced with
+                                //another alloc call. Need to copy it out right now
+                                let buffer =
+                                    Buf::new_from(&buffer, Some(nread)).unwrap().readonly();
+                                eprintln!(
+                                    "CB: ptr: {:?}, base: {:?}, len: {:?}",
+                                    buffer.buf,
+                                    unsafe { *buffer.buf }.base,
+                                    unsafe { *buffer.buf }.len
+                                );
+                                //eprintln!( "CB: b.allocated: {}, size: {}, ptr: {:?}, contents: {:?}", buffer.is_allocated(), nread, buffer.index(0..6).as_ptr(), &buffer.index(0..6));
                                 ir.borrow_mut().push_back(Ok((0, nread, buffer)));
                                 if let Some(w) = iw.take() {
                                     w.wake();
@@ -254,24 +247,25 @@ impl AsyncRead for MyTcp {
                 ),
             );
             if let Err(e) = r {
-                print!("ERRORS HAPPEN:read_start: {}", e);
+                eprintln!("ERRORS HAPPEN:read_start: {}", e);
                 return Poll::Ready(Err(std::io::Error::other(e)));
             }
         }
 
-        print!("HERE0");
+        eprintln!("Read0");
         if mut_self.read_waker.borrow().is_some() {
-            print!("HERE1");
+            eprintln!("Read1");
             return Poll::Ready(Err(std::io::Error::from(ErrorKind::AlreadyExists)));
         }
 
-        print!("HERE2");
+        eprintln!("Read2");
         if mut_self.reads.borrow().is_empty() {
-            print!("HERE3");
+            eprintln!("Read3");
             mut_self.read_waker.borrow_mut().replace(cx.waker().clone());
             return Poll::Pending;
         }
 
+        eprintln!("Read4");
         Poll::Ready(copy_into_from_vec_buffs(
             buf,
             &mut mut_self.reads.borrow_mut(),
@@ -286,51 +280,78 @@ fn copy_into_from_vec_buffs(
 ) -> Result<usize, std::io::Error> {
     let mut into_buff_bytes_read: usize = 0;
 
-    print!("MVNBF0: br: {},{}", into_buff_bytes_read, into_buff.len());
-    loop {
-        //Check incoming
-        match from_buffs.front_mut() {
-            Some(Ok((start, len, b))) => {
-                print!("MVNBF1: br: {},{} f: {},{}", into_buff_bytes_read, into_buff.len(), start, len);
-                //If there is less (or equal) incoming than room in my buffer, consume it all and copy into incoming
-                //and return bytes_consumed
-                if (*len - *start) <= into_buff.len() - into_buff_bytes_read {
-                    let nsb: &mut [u8] = into_buff.index_mut(into_buff_bytes_read..*len - *start);
-                    nsb.copy_from_slice(b.index(*start..*len));
-                    into_buff_bytes_read += *len - *start;
-                    from_buffs.pop_front();
-                } else {
-                    //If there is not enough room in my buffer for the amount in the incoming then update that
-                    //to reflect how much I was able to read, leave it alone and then
-                    let into_len = into_buff.len();
-                    let nsb: &mut [u8] = into_buff.index_mut(into_buff_bytes_read..);
-                    nsb.copy_from_slice(b.index(*start..(*start + into_len)));
-                    into_buff_bytes_read += *start + into_len;
-                    *start += into_len;
+    //Check incoming
+    match from_buffs.front_mut() {
+        Some(Ok((start, len, b))) => {
+            //eprintln!( "Copy1P: b.allocated: {}, size: {}, ptr: {:?}, contents: {:?}", b.is_allocated(), len, b.index(0..6).as_ptr(), &b.index(0..6));
+            eprintln!(
+                "Copy1P: size:{}, ptr: {:?}, base: {:?}, len: {:?}",
+                len,
+                b.buf,
+                unsafe { *b.buf }.base,
+                unsafe { *b.buf }.len
+            );
+            //eprintln!( "Copy1: br: {},{} f: {},{} contents: {:?}", into_buff_bytes_read, into_buff.len(), start, len, &b.index(0..6),);
+            //If there is less (or equal) incoming than room in my buffer, consume it all and copy into incoming
+            //and return bytes_consumed
+            if (*len - *start) <= into_buff.len() - into_buff_bytes_read {
+                eprintln!(
+                    "Copy1C: ({},{}) -> ({},{})",
+                    *start,
+                    *len,
+                    into_buff_bytes_read,
+                    *len - *start,
+                );
+                for i in 0..into_buff.len() {
+                    into_buff[i] = b[*start + i];
                 }
-            }
-            Some(Err(e)) => {
-                print!("MVNBF2: br: {},{} e: {}", into_buff_bytes_read, into_buff.len(), e);
-                if let libuv::EOF = e {
-                    return Ok(into_buff_bytes_read);
-                }
-                let ret =Err(std::io::Error::other(*e)); 
-                //Consume the error off the buffer and return it
+                //into_buff[into_buff_bytes_read..*len - *start - 1]
+                //    .copy_from_slice(&b[*start..*len - 1]);
+                //eprintln!("Copy1V: {:?} == {:?}", &into_buff[0..6], &b.index(0..6));
+                //eprintln!("Copy1P: bfptr: {:?}", b.buf);
+                into_buff_bytes_read += *len - *start;
+                //Nothing left in this buffer, discard
                 from_buffs.pop_front();
-                return ret;
+            } else {
+                //If there is not enough room in my buffer for the amount in the incoming then update that
+                //to reflect how much I was able to read, leave it alone and then
+                let into_len = into_buff.len();
+                //TODO These buffers do not like the indexing math, so it might be easier to do it
+                //manually, there might be a hidden issue here
+                let nsb: &mut [u8] = &mut into_buff[into_buff_bytes_read..];
+
+                nsb.copy_from_slice(&b[*start..(*start + into_len)]);
+                into_buff_bytes_read += *start + into_len;
+                *start += into_len;
             }
-            _ => {}
         }
-        print!("MVNBF3: br: {},{}", into_buff_bytes_read, into_buff.len());
-        if into_buff_bytes_read >= into_buff.len() {
-            break;
+        Some(Err(e)) => {
+            eprintln!(
+                "Copy2: br: {},{} e: {}",
+                into_buff_bytes_read,
+                into_buff.len(),
+                e
+            );
+            if let libuv::EOF = e {
+                //eprintln!("Returning: {}, underlying slice contains: {:?}", into_buff_bytes_read, &into_buff[0..into_buff_bytes_read]);
+                return Ok(into_buff_bytes_read);
+            }
+            let ret = Err(std::io::Error::other(*e));
+            //Consume the error off the buffer and return it
+            from_buffs.pop_front();
+            return ret;
         }
+        _ => {}
     }
 
-    print!("MVNBF4: br: {},{}", into_buff_bytes_read, into_buff.len());
+    eprintln!("Copy4: br: {},{}", into_buff_bytes_read, into_buff.len());
+    //eprintln!("Copy4: first 6 bytes: {:?}", &into_buff[0..6]);
     Ok(into_buff_bytes_read)
 }
 
+// libuv is completion based io, whereas async write is (poll based io) not
+// https://users.rust-lang.org/t/will-asyncwrite-give-the-same-buf-on-returning-poll-pending/104031/3
+// This ensures that there is a queue of writes that occour
 impl AsyncWrite for MyTcp {
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
@@ -338,7 +359,13 @@ impl AsyncWrite for MyTcp {
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         //Need to dump the bytes and return ready for this buffer
-        let bufs = Buf::new_from_bytes(buf).unwrap();
+        eprintln!(
+            "Writing {} bytes: {}",
+            buf.len(),
+            std::str::from_utf8(buf).unwrap()
+        );
+        let mut bufsn = Buf::new_from_bytes(buf).unwrap();
+        let mut bufs = Buf::new_from(&bufsn, Some(buf.len())).unwrap();
         let writes = self.writes.clone();
         writes.borrow_mut().push(None);
         //set up a callback for flush to wait on if called
@@ -346,6 +373,8 @@ impl AsyncWrite for MyTcp {
             .get_mut()
             .handle
             .write(&[bufs], move |_handle, _status| {
+                bufsn.destroy();
+                bufs.destroy();
                 if let Some(Some(w)) = writes.borrow_mut().pop() {
                     w.wake_by_ref();
                 }
@@ -355,10 +384,12 @@ impl AsyncWrite for MyTcp {
             Err(e) => Poll::Ready(Err(std::io::Error::other(e))),
         }
     }
+
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
+        eprintln!("FLUSHING!!!");
         if self.writes.borrow().is_empty() {
             return Poll::Ready(Ok(()));
         }
@@ -374,7 +405,19 @@ impl AsyncWrite for MyTcp {
         self: std::pin::Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<std::io::Result<()>> {
-        todo!()
+        eprintln!("Closing");
+        if self.close_waker.borrow().is_some() {
+            return Poll::Ready(Err(std::io::Error::from(ErrorKind::AlreadyExists)));
+        }
+
+        self.close_waker.replace(Some(cx.waker().clone()));
+        let cw = self.close_waker.clone();
+        self.get_mut().handle.close(move |_handle| {
+            if let Some(ref w) = cw.borrow_mut().take() {
+                w.wake_by_ref();
+            }
+        });
+        Poll::Pending
     }
 }
 
@@ -423,107 +466,6 @@ impl Into<ConnectCB<'static>> for &ConnectFuture {
     }
 }
 
-/*
-#[derive(Clone)]
-struct WriteFuture {
-    waker: Rc<RefCell<Option<Waker>>>,
-    result: Rc<RefCell<Option<Result<u32, libuv::Error>>>>,
-}
-
-impl WriteFuture {
-    fn new() -> Self {
-        Self {
-            waker: Rc::new(RefCell::new(None)),
-            result: Rc::new(RefCell::new(None)),
-        }
-    }
-}
-
-impl Future for WriteFuture {
-    type Output = Result<u32, libuv::Error>;
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        //The callback should transfer the result (inputs for the cb) to this future and then call
-        //wake
-        match self.result.borrow_mut().take() {
-            Some(r) => Poll::Ready(r),
-            None => {
-                self.waker.replace(Some(cx.waker().clone()));
-                Poll::Pending
-            }
-        }
-    }
-}
-
-#[allow(clippy::from_over_into)]
-impl Into<WriteCB<'static>> for &WriteFuture {
-    fn into(self) -> WriteCB<'static> {
-        let iw = self.waker.clone();
-        let ir = self.result.clone();
-        WriteCB::CB(Box::new(move |_handle, status| {
-            //I am finished, let's store the result back into myself and then call the waker
-            ir.borrow_mut().replace(status);
-            if let Some(ref w) = *iw.borrow() {
-                w.wake_by_ref();
-            }
-        }))
-    }
-}
-
-#[derive(Clone)]
-struct ReadStream {
-    waker: Rc<RefCell<Option<Waker>>>,
-    result: Rc<RefCell<Option<Result<String, libuv::Error>>>>,
-}
-
-impl ReadStream {
-    fn new() -> Self {
-        Self {
-            waker: Rc::new(RefCell::new(None)),
-            result: Rc::new(RefCell::new(None)),
-        }
-    }
-}
-
-impl Stream for ReadStream {
-    type Item = Result<String, libuv::Error>;
-    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        //The callback should transfer the result  to this future and then call wake
-        match self.result.borrow_mut().take() {
-            Some(r) => {
-                if r.is_err() {
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Some(r))
-            }
-            None => {
-                self.waker.replace(Some(cx.waker().clone()));
-                Poll::Pending
-            }
-        }
-    }
-}
-
-#[allow(clippy::from_over_into)]
-impl Into<ReadCB<'static>> for &ReadStream {
-    fn into(self) -> ReadCB<'static> {
-        let iw = self.waker.clone();
-        let ir = self.result.clone();
-        ReadCB::CB(Box::new(move |_handle, status, buffer| {
-            //I am finished, let's store the result back into myself and then call the waker
-            if status.is_err() {
-                return;
-            }
-            //I think this buffer dissapears after I return right here
-            let s = String::from(buffer.to_str(status.unwrap()).unwrap());
-            ir.borrow_mut().replace(Ok(s));
-            if let Some(ref w) = *iw.borrow() {
-                w.wake_by_ref();
-            }
-        }))
-    }
-}
-*/
-
 unsafe extern "C" {
     pub fn luv_loop(lua_state: *mut State) -> *mut uv_loop_t;
 }
@@ -538,6 +480,7 @@ fn get_lua_loop() -> Loop {
         handle: unsafe { with_state(|state| luv_loop(state)) },
         should_drop: false,
     };
+    eprintln!("LLPTR: {:?}", lua_loop.handle);
     unsafe { mem::transmute(lua_loop) }
 }
 
@@ -546,7 +489,7 @@ pub fn seanvim() -> nvim_oxi::Result<Dictionary> {
     let greetings = |args: CommandArgs| {
         let who = args.args.unwrap_or("from  Rust".to_owned());
         let bang = if args.bang { "!" } else { "" };
-        print!("Hello {}{}", who, bang);
+        eprintln!("Hello {}{}", who, bang);
     };
 
     api::create_user_command(
@@ -709,63 +652,79 @@ pub fn seanvim() -> nvim_oxi::Result<Dictionary> {
         let _ = notify("Hello", LogLevel::Info, &Dictionary::new());
     });
 
-    let mut b = buf.clone();
-    let _ = sean_vim.borrow().spawner().spawn_local(async move {
-        let mut my_tcp = MyTcp::new(&l);
-        let addr: SocketAddr = SocketAddr::from_str("192.168.254.37:11434").unwrap();
-        let r = my_tcp.connect(addr).await;
-        let _ = match r {
-            Ok(r) => notify(
-                &format!("Connected! {}", r),
-                LogLevel::Info,
-                &Dictionary::new(),
-            ),
-            Err(e) => notify(
-                &format!("Connected? {}", e),
-                LogLevel::Info,
-                &Dictionary::new(),
-            ),
-        };
-        if r.is_err() {
-            return;
-        }
-        let out = String::from(
-            "GET / HTTP/1.1\r\nHost: localhost\r\nUser-Agent: nvim-libuv\r\nAccept: */*\r\nConnection: close\r\n\r\n",
-        );
-        let r = my_tcp.write(out.as_bytes()).await;
-        let _ = match r {
-            Ok(r) => notify(&format!("Wrote! {}", r), LogLevel::Info, &Dictionary::new()),
-            Err(e) => notify(&format!("Wrote? {}", e), LogLevel::Info, &Dictionary::new()),
-        };
-        let mut in_vec: Vec<u8> = vec![0;2048];
-        let r = my_tcp.read(&mut in_vec[..]).await;
-        let _ = match r {
-            Ok(r) => notify(&format!("Read! {}", r), LogLevel::Info, &Dictionary::new()),
-            Err(e) => notify(&format!("Read? {}", e), LogLevel::Info, &Dictionary::new()),
-        };
-        //use futures::StreamExt;
-        //let read_stream = my_tcp.read_start();
-        /*
-        if let Ok(read_stream) = read_stream {
-            pin_mut!(read_stream);
-            loop {
-                let r = read_stream.next().await;
-                if let Some(r) = r {
-                    match r {
-                        Ok(r) => {
-                            let _ = b.set_lines(.., false, vec!(r));
-                        },
-                        Err(e) => {
-                            let _ = notify(&format!("Read? {}", e), LogLevel::Info, &Dictionary::new());
-                        }
-                    };
+    api::create_user_command(
+        "SeanOllama",
+        move |args: CommandArgs| {
+            let msg = args.args.unwrap_or("can you introduce yourself?".to_owned());
+            let _ = sean_vim.borrow().spawner().spawn_local(async move {
+                let l = get_lua_loop();
+                let mut my_tcp = MyTcp::new(&l);
+                let addr: SocketAddr = SocketAddr::from_str("192.168.254.37:11434").unwrap();
+                //let addr: SocketAddr = SocketAddr::from_str("104.248.184.153:80").unwrap();
+
+                let r = my_tcp.connect(addr).await;
+                let _ = match r {
+                    Ok(r) => notify(
+                        &format!("Connected! {}", r),
+                        LogLevel::Info,
+                        &Dictionary::new(),
+                    ),
+                    Err(e) => notify(
+                        &format!("Connected? {}", e),
+                        LogLevel::Info,
+                        &Dictionary::new(),
+                    ),
+                };
+                if r.is_err() {
+                    return;
                 }
-            }
-        }else{
-            print!("an error!");
-        }
-        */
-    });
+
+                //TODO NEXT I'd like to get the selected text here and pass it to the llm with some context
+
+
+                let mut my_req = Request::post("http://seanvim.requestcatcher.com/api/generate");
+                my_req.insert_header("User-Agent", "nvim-libuv");
+                my_req.insert_header("Accept", "application/json");
+                my_req.insert_header("Content-Type", "application/json");
+                my_req.insert_header("Connection", "close");
+                let rb = json!({
+                    "model": "gemma3:12b",
+                    "prompt": "can you introduce yourself?",
+                    "stream": false
+                });
+                my_req.set_body(rb);
+                let r = async_h1::connect(my_tcp, my_req).await;
+                match r {
+                    Ok(mut res) => {
+                        print!("Response: {:?}", res);
+                        let b = res.take_body();
+                        //let s = b.into_string().await.unwrap();
+                        //print!("Response Body: {}", s);
+                        let j_r = b.into_json::<OllamaGenerateResponse>().await;
+                        print!("Response: {:?}", j_r);
+                        if let Ok(j) = j_r {
+                            print!("Response Body: {}", j.response);
+                            let _ = nvim_oxi::api::call_function::<(&str, &str), ()>(
+                                "setreg",
+                                ("o", j.response.as_str()),
+                            );
+                        }
+                    }
+                    Err(e) => print!("Response: ERROR: {:?}", e),
+                }
+            });
+        },
+        &CreateCommandOpts::builder()
+            .bang(true)
+            .desc("dumps an ollama call into the o register")
+            .nargs(CommandNArgs::ZeroOrOne)
+            .build(),
+    )?;
 
     Ok(api)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OllamaGenerateResponse {
+    response: String,
 }

@@ -7,8 +7,12 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-nvim-oxi = { version = "0.6.0", features = ["neovim-0-11"] }
+nvim-oxi = { version = "0.6.0", features = ["neovim-0-11", "mlua"] }
 futures = "0.3.31"
-libuv = "2.12.0"
+#libuv = "2.12.0"
+libuv = {path="/home/sean/Documents/Workspace/Rust/libuv-rs"}
 libuv-sys2 = "1.51.0"
 http-types = { version = "2.12.0", default-features = false, features = ["cookies"]}
+async-h1 = {version = "2.3.4"}
+serde = {version = "1.0.219"}
+serde_json = {version = "1.0.143"}
