@@ -151,6 +151,8 @@ impl SeanVim {
     }
 }
 
+//Write a rust function that iterates over a range of numbers from 0 to 10
+
 type ReadTup = (usize, usize, ReadonlyBuf);
 
 //Let's make an http call
@@ -207,13 +209,7 @@ impl AsyncRead for MyTcp {
             let r = mut_self.handle.read_start(
                 Box::new(|_handle, size| {
                     let nb = Buf::with_capacity(size).unwrap();
-                    eprintln!(
-                        "ALLOC: size:{}, ptr: {:?}, base: {:?}, len: {:?}",
-                        size,
-                        nb.buf,
-                        unsafe { *nb.buf }.base,
-                        unsafe { *nb.buf }.len
-                    );
+                    //eprintln!( "ALLOC: size:{}, ptr: {:?}, base: {:?}, len: {:?}", size, nb.buf, unsafe { *nb.buf }.base, unsafe { *nb.buf }.len);
                     Some(nb)
                 }),
                 Box::new(
@@ -224,12 +220,7 @@ impl AsyncRead for MyTcp {
                                 //another alloc call. Need to copy it out right now
                                 let buffer =
                                     Buf::new_from(&buffer, Some(nread)).unwrap().readonly();
-                                eprintln!(
-                                    "CB: ptr: {:?}, base: {:?}, len: {:?}",
-                                    buffer.buf,
-                                    unsafe { *buffer.buf }.base,
-                                    unsafe { *buffer.buf }.len
-                                );
+                                //eprintln!( "CB: ptr: {:?}, base: {:?}, len: {:?}", buffer.buf, unsafe { *buffer.buf }.base, unsafe { *buffer.buf }.len);
                                 //eprintln!( "CB: b.allocated: {}, size: {}, ptr: {:?}, contents: {:?}", buffer.is_allocated(), nread, buffer.index(0..6).as_ptr(), &buffer.index(0..6));
                                 ir.borrow_mut().push_back(Ok((0, nread, buffer)));
                                 if let Some(w) = iw.take() {
@@ -284,13 +275,7 @@ fn copy_into_from_vec_buffs(
     match from_buffs.front_mut() {
         Some(Ok((start, len, b))) => {
             //eprintln!( "Copy1P: b.allocated: {}, size: {}, ptr: {:?}, contents: {:?}", b.is_allocated(), len, b.index(0..6).as_ptr(), &b.index(0..6));
-            eprintln!(
-                "Copy1P: size:{}, ptr: {:?}, base: {:?}, len: {:?}",
-                len,
-                b.buf,
-                unsafe { *b.buf }.base,
-                unsafe { *b.buf }.len
-            );
+            //eprintln!( "Copy1P: size:{}, ptr: {:?}, base: {:?}, len: {:?}", len, b.buf, unsafe { *b.buf }.base, unsafe { *b.buf }.len);
             //eprintln!( "Copy1: br: {},{} f: {},{} contents: {:?}", into_buff_bytes_read, into_buff.len(), start, len, &b.index(0..6),);
             //If there is less (or equal) incoming than room in my buffer, consume it all and copy into incoming
             //and return bytes_consumed
@@ -303,6 +288,7 @@ fn copy_into_from_vec_buffs(
                     *len - *start,
                 );
                 for i in 0..into_buff.len() {
+                    if i >= *len{break} 
                     into_buff[i] = b[*start + i];
                 }
                 //into_buff[into_buff_bytes_read..*len - *start - 1]
@@ -655,7 +641,9 @@ pub fn seanvim() -> nvim_oxi::Result<Dictionary> {
     api::create_user_command(
         "SeanOllama",
         move |args: CommandArgs| {
-            let msg = args.args.unwrap_or("can you introduce yourself?".to_owned());
+            let msg = args
+                .args
+                .unwrap_or("can you introduce yourself?".to_owned());
             let _ = sean_vim.borrow().spawner().spawn_local(async move {
                 let l = get_lua_loop();
                 let mut my_tcp = MyTcp::new(&l);
@@ -680,7 +668,25 @@ pub fn seanvim() -> nvim_oxi::Result<Dictionary> {
                 }
 
                 //TODO NEXT I'd like to get the selected text here and pass it to the llm with some context
-
+                if let Ok(mode) = nvim_oxi::api::get_mode() {
+                    if mode.mode == "V" {
+                        let sp = nvim_oxi::api::call_function::<(&str,), (i32,i32,i32,i32)>(
+                            "getpos", ("v",)
+                        );
+                        let ep = nvim_oxi::api::call_function::<(&str,), (i32,i32,i32,i32)>(
+                            "getpos", (".",)
+                        );
+                        if sp.is_ok() && ep.is_ok(){
+                            let sp = sp.unwrap();
+                            let ep = ep.unwrap();
+                        let ep = nvim_oxi::api::call_function::<(i32,i32,i32,i32,i32,i32,i32,i32), String>(
+                            "getregion", (sp.0,sp.1,sp.2,sp.3,ep.0,ep.1,ep.2,ep.3)
+                        );
+                            if ep.is_ok(){
+                        print!("Wow, here {}", ep.unwrap());}
+                        }
+                    }
+                }
 
                 let mut my_req = Request::post("http://seanvim.requestcatcher.com/api/generate");
                 my_req.insert_header("User-Agent", "nvim-libuv");
