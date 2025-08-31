@@ -26,6 +26,7 @@ You might also want some sort of plugin manager, I'm using lazy with nvchad.
 4. Run `mv target/debug/libseanvim.so lua/seanvim.so`
 5. Get nvim to recognize the directory as a plugin. I use lazy so in ~/.config/nvim/lua/plugins/init.lua I added:
 
+
     {
         dir = "~/Documents/Workspace/blended/seanvim",
         opts = {
@@ -44,6 +45,7 @@ You might also want some sort of plugin manager, I'm using lazy with nvchad.
         },
     },
 
+
 6. Now in nvim run `:SeanSpawn yourname`
 7. View the messages `:messages`
 8. Or navigate somewhere in your buffer, and press space - s - v
@@ -53,14 +55,14 @@ You might also want some sort of plugin manager, I'm using lazy with nvchad.
 Links and refs
 ---
 
-(Lib UV Docs)[https://docs.libuv.org/en/v1.x/handle.html#c.uv_alloc_cb]
-(Nvim OXI Github)[https://github.com/noib3/nvim-oxi/]
-(Nvim OXI Docs)[https://docs.rs/nvim-oxi/latest/nvim_oxi/struct.Object.html#impl-From%3CString%3E-for-Object]
-(LibUV Sys Rust Crate)[https://github.com/bmatcuk/libuv-sys/]
-(LibUV Lua Bindings)[https://github.com/luvit/luv/tree/master]
-(LuaJIT FFI)[https://luajit.org/ext_ffi.html]
-(HTTP Types Rust Library)[https://github.com/http-rs/http-types]
-(Http types docs)[https://docs.rs/http-types/latest/http_types/struct.Request.html#impl-AsyncRead-for-Request]
-(Http Client Rust Github)[https://github.com/http-rs/http-client]
-(Ollama API Refrence)[https://ollama.readthedocs.io/en/api/#parameters]
-(NeoVim API Docs)[https://neovim.io/doc/user/builtin.html#getpos()]
+* [Lib UV Docs](https://docs.libuv.org/en/v1.x/handle.html#c.uv_alloc_cb)
+* [Nvim OXI Github](https://github.com/noib3/nvim-oxi/)
+* [Nvim OXI Docs](https://docs.rs/nvim-oxi/latest/nvim_oxi/struct.Object.html#impl-From%3CString%3E-for-Object)
+* [LibUV Sys Rust Crate](https://github.com/bmatcuk/libuv-sys/)
+* [LibUV Lua Bindings](https://github.com/luvit/luv/tree/master)
+* [LuaJIT FFI](https://luajit.org/ext_ffi.html)
+* [HTTP Types Rust Library](https://github.com/http-rs/http-types)
+* [Http types docs](https://docs.rs/http-types/latest/http_types/struct.Request.html#impl-AsyncRead-for-Request)
+* [Http Client Rust Github](https://github.com/http-rs/http-client)
+* [Ollama API Refrence](https://ollama.readthedocs.io/en/api/#parameters)
+* [NeoVim API Docs](https://neovim.io/doc/user/builtin.html#getpos())
