@@ -20,13 +20,13 @@ use libuv_sys2::uv_loop_t;
 use nvim_oxi::api::{self, notify, opts::*, types::*};
 use nvim_oxi::lua::ffi::State;
 use nvim_oxi::lua::with_state;
-use nvim_oxi::{Dictionary, Function, Object, print, schedule};
+use nvim_oxi::{print, schedule, Dictionary, Function, ObjectKind};
 
 type Incoming = RefCell<Vec<LocalFutureObj<'static, ()>>>;
 
 #[derive(Default)]
 struct SeanVim {
-    url: Option<Object>,
+    url: String,
     pool: FuturesUnordered<LocalFutureObj<'static, ()>>,
     incoming: Rc<Incoming>,
     waker: Option<Waker>,
@@ -89,7 +89,7 @@ impl Wake for LuvWaker {
 impl SeanVim {
     fn new() -> Self {
         Self {
-            url: None,
+            url: "127.0.0.1:11434".into(),
             pool: FuturesUnordered::new(),
             incoming: Rc::new(RefCell::new(Vec::new())),
             waker: None,
@@ -105,7 +105,14 @@ impl SeanVim {
     }
 
     fn setup(&mut self, config: Dictionary) {
-        self.url = config.get("url").cloned();
+        if let Some(urlo) = config.get("url"){
+            let urlo = urlo.to_owned();
+            if let ObjectKind::String = urlo.kind(){
+                if let Ok(ns) = TryInto::<nvim_oxi::String>::try_into(urlo){
+                self.url = ns.to_string();
+                }
+            }
+        }
     }
 
     fn run(&mut self) {
@@ -482,11 +489,11 @@ pub fn seanvim() -> nvim_oxi::Result<Dictionary> {
     )?;
 
     let ollama_generate: Function<(), Result<(), api::Error>> = Function::from_fn(move |()| {
+        let url = sean_vim.borrow().url.clone();
         let _ = sean_vim.borrow().spawner().spawn_local(async move {
             let l = get_lua_loop();
             let mut my_tcp = MyTcp::new(&l);
-            let addr: SocketAddr = SocketAddr::from_str("192.168.254.37:11434").unwrap();
-            //let addr: SocketAddr = SocketAddr::from_str("104.248.184.153:80").unwrap();
+            let addr: SocketAddr = SocketAddr::from_str(&url).unwrap();
 
             let r = my_tcp.connect(addr).await;
             match r {
