@@ -26,25 +26,23 @@ You might also want some sort of plugin manager, I'm using lazy with nvchad.
 4. Run `mv target/debug/libseanvim.so lua/seanvim.so`
 5. Get nvim to recognize the directory as a plugin. I use lazy so in ~/.config/nvim/lua/plugins/init.lua I added:
 
-
-    {
-        dir = "~/Documents/Workspace/blended/seanvim",
-        opts = {
-          url = "192.168.0.10:11434"
+        {
+            dir = "~/Documents/Workspace/blended/seanvim",
+            opts = {
+              url = "192.168.0.10:11434"
+            },
+            config = true,
+            cmd = "SeanSpawn",
+            keys = {
+              {
+                "<leader>sv",
+                function()
+                  require("seanvim").ollama_generate()
+                end,
+                desc = "Update your buffer based on ollama response",
+              },
+            },
         },
-        config = true,
-        cmd = "SeanSpawn",
-        keys = {
-          {
-            "<leader>sv",
-            function()
-              require("seanvim").ollama_generate()
-            end,
-            desc = "Update your buffer based on ollama response",
-          },
-        },
-    },
-
 
 6. Now in nvim run `:SeanSpawn yourname`
 7. View the messages `:messages`
